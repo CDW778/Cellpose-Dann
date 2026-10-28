@@ -1,0 +1,41 @@
+# Domain Shift Quantification
+
+## Background
+Quantify domain shift in MIDOG++ patch features across scanners, tumor types, and lab origins. Each metric measures the gap between two feature distributions in a different way, letting us compare how strongly each metadata axis biases the features.
+
+## Install
+```bash
+pip install numpy pandas scipy scikit-learn matplotlib seaborn
+```
+
+## Usage
+Run from inside the `Domain Shift Quantification` folder so relative paths resolve:  
+```bash
+python MMD_v1.py ../Feature_extractors/CTransPath/midog_features.pkl
+python CORAL_v1.py ../Feature_extractors/CTransPath/midog_features.pkl
+python "Wasserstein Distance_v1.py" ../Feature_extractors/CTransPath/midog_features.pkl
+python "Proxy A-Distance.py" ../Feature_extractors/CTransPath/midog_features.pkl
+```
+Each script first does a global pass (by `domain` / `Scanner` / `Tumor` / `Origin`), then a controlled pass that fixes one factor and varies another.
+
+## Key files
+- `midog.csv` - slide-level metadata
+- `MMD_v1.py` - Maximum Mean Discrepancy (distribution shift).
+- `CORAL_v1.py` - covariance alignment.
+- `Wasserstein Distance_v1.py` - marginal transport distance.
+- `Proxy A-Distance.py` - SVM-based separability score.
+- `slide_505_similarity_ranking.csv` - example slide-level ranking output.
+
+## Customization: Using Different Feature Extractors
+If you wish to use a different feature extraction model (CLIP, dinoV3, etc), follow these steps:
+
+1. Generate your feature embeddings from one of the `Phase 1/Feature_extractors`. It should save them in a .pkl dictionary format: { 'filename.tiff': {'features': np.array, ...} }.
+2. In the quantification scripts (MMD_v1.py, CORAL_v1.py, etc.), pass your custom feature pickle as the argument:
+```bash
+python MMD_v1.py ./clip_features.pkl
+python MMD_v1.py ./dinov3_features.pkl
+```
+3. Make sure your new features match the expected dimensions (e.g., 768 for CTransPath) or update the visualization scripts accordingly.
+
+## Output
+Each script writes to its own `*_results/` folder: pairwise distance CSVs and heatmap PNGs. These feed into `Phase 1/Similarity/` for fusion and ranking.

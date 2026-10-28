@@ -1,0 +1,137 @@
+方案:接入 lillianlam DANN 有丝分裂分类器(MIDOG++)到我们的 Cellpose 管线
+================================================================
+
+## 0. 目标
+现状:Cellpose(一阶段)+ ConvNeXt-V2-tiny(二阶段分类)端到端有丝分裂检测,
+test slide04 e2e 5µm F1 ≈ 0.687 ± 0.03。
+本方案:把二阶段分类器换成一个公开的、有权重的、mitosis/非 分类器
+(lillianlam/multi-stage-dann-model-mitotic-figures,ResNet50 + DANN,训练于 MIDOG++),
+零样本接到我们的 Cellpose 候选上,看能否比现在强。二阶段不需要重训(直接加载权重即可跑)。
+
+----------------------------------------------------------------
+
+## 1. 需要手动下载的资源(链接)
+
+### 权重(HuggingFace)
+- 模型页: https://huggingface.co/lillianlam/multi-stage-dann-model-mitotic-figures
+- 权重文件: https://huggingface.co/lillianlam/multi-stage-dann-model-mitotic-figures/resolve/main/best_dann_model.pth
+  - 建议放: /home/hyw/chendawei/classification-weight/dann/best_dann_model.pth
+
+### 源码(GitHub)
+- 仓库: https://github.com/Lillian-Lam/Biomedical-Data-Design-MIDOG
+- 模型定义(DANNModel): Phase 2/final_model.py
+  raw: https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/Phase%202/final_model.py
+- 输入裁剪口径: Phase 2/pre_processing/224_patch_around_bbox.py
+  raw: https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/Phase%202/pre_processing/224_patch_around_bbox.py
+- 细胞分割->COCO(可选参考): Phase 2/pre_processing/cell_segmentation_to_coco.py
+  raw: https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/Phase%202/pre_processing/cell_segmentation_to_coco.py
+- Phase2 说明: https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/Phase%202/README.md
+- 依赖: https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/requirements.txt
+
+### 快速下载命令(手动执行)
+mkdir -p /home/hyw/chendawei/classification-weight/dann
+wget -O /home/hyw/chendawei/classification-weight/dann/best_dann_model.pth \
+  https://huggingface.co/lillianlam/multi-stage-dann-model-mitotic-figures/resolve/main/best_dann_model.pth
+
+mkdir -p /tmp/opencode/dann_src
+cd /tmp/opencode/dann_src
+wget -O final_model.py "https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/Phase%202/final_model.py"
+wget -O 224_patch_around_bbox.py "https://raw.githubusercontent.com/Lillian-Lam/Biomedical-Data-Design-MIDOG/main/Phase%202/pre_processing/224_patch_around_bbox.py"
+# HF 若需要登录: huggingface-cli login (该模型 gated=false,通常可直接下)
+
+----------------------------------------------------------------
+
+## 2. 模型规格(已从源码核对)
+- DANNModel:ResNet50(ImageNet 预训练)-> 多尺度特征(layer2 512 + layer3 1024 + layer4 2048 = 3584-d)
+  -> MLP 二分类(2 类)。
+- 训练时用 DANN 域对抗(4 个头:Tumor/Species/Origin/Scanner),目标是跨扫描仪/实验室/物种泛化。
+- 标签: 0 = non-mitotic, 1 = mitotic。
+- 推理: logits = model.predict_only(x); p_mitosis = torch.softmax(logits, dim=1)[:, 1]。
+- 构造(必须用这个 dict 才能 load state_dict):
+      num_domain_classes = {'Tumor': 7, 'Species': 2, 'Origin': 4, 'Scanner': 4}
+      model = DANNModel(num_classes=2, num_domain_classes=num_domain_classes, lambda_val=0.0)
+      model.load_state_dict(torch.load("best_dann_model.pth", map_location="cpu"))
+      model.eval()
+- 输入: 224x224 RGB 原始窗口(不是白板!),ImageNet 归一化:
+      mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+
+----------------------------------------------------------------
+
+## 3. 输入裁剪口径(严格照 224_patch_around_bbox.py)
+bbox = [x1, y1, x2, y2]            # 这里用 Cellpose mask 的 bbox
+cx = (x1 + x2)//2 ; cy = (y1 + y2)//2
+half = 224//2
+left = max(0, cx-half) ; top = max(0, cy-half)
+right = left+224 ; bottom = top+224
+if right > W: right = W ; left = right-224    # 贴左边
+if bottom > H: bottom = H ; top = bottom-224  # 贴上边
+patch = img.crop((left, top, right, bottom))  # RGB 原图
+if patch.size != (224,224): patch = patch.resize((224,224))
+注: 固定像素窗口(不按细胞大小缩放)。A 扫描仪 0.2456µm/px 与 MIDOG 量级接近,尺度大致可比。
+
+----------------------------------------------------------------
+
+## 4. 接入方案(零样本,不重训)
+对每张 test HPF:
+  1) Cellpose(现场, 输入用 RGB) -> 全部 mask
+  2) 每个 mask:
+       取 mask bbox 中心 -> 按上面口径裁 224x224 原始 RGB 窗口
+       -> RGB -> ToTensor -> ImageNet 归一化
+       -> DANNModel.predict_only -> softmax[:,1] = p_mitosis
+  3) detections = (mask 质心 x,y, p)
+  4) 阈值扫描 0.05~0.95 -> 5µm 一对一贪心匹配 -> F1/P/R/TP/FP/FN
+对比: 当前最优 e2e 5µm F1(test 04) ≈ 0.687
+
+----------------------------------------------------------------
+
+## 5. 待创建的文件(在新目录/新会话里)
+1. dann_model.py —— 从 final_model.py 只抽
+   GradientReversalFunction / GradientReversalLayer / DANNModel
+   (不要引入 umap/seaborn/histomicstk 等重依赖)。
+2. eval_2012_dann_live.py —— 复用现有评估逻辑(eval_2012_live.py)与工具
+   (gen_dataset_2012.py: load_gt_regions/find_csv),把“分类器”换成 DANN、
+   “输入”换成 224 原始窗口。
+3. 其余保持不变:现场 Cellpose、5µm 匹配、阈值扫描。
+
+----------------------------------------------------------------
+
+## 6. 环境
+- 现有 conda 环境 cellpose(Python3.8, torch 2.4.1)+ torchvision + PIL 即可。
+- 无需 mmdetection / Caffe / 新环境。
+- 运行前: export KMP_DUPLICATE_LIB_OK=TRUE
+
+----------------------------------------------------------------
+
+## 7. 本项目已有资源(新目录可直接引用的绝对路径)
+- test 原图: /home/hyw/dataset/chendawei/train-classification/ICPR-2012/train-val-test/test-original-img/*.bmp
+- Cellpose 缓存(RGB 口径): /home/hyw/dataset/chendawei/train-classification/ICPR-2012/cellpose_cache/test_masks_cp3/*_mask.npy
+- GT(CSV): /home/hyw/dataset/chendawei/ICPR2012/{A,H}0?_v2/{base}.csv
+- Cellpose 权重: /home/hyw/chendawei/cellpose-weight/cpsam_v2
+- 分辨率: A=0.2456 µm/px, H=(0.2273+0.22753)/2 µm/px
+- 参考脚本: eval_2012_live.py, gen_dataset_2012.py, dump_fpfn_2012.py
+注意: 数据/权重放 /home/hyw/dataset/... 与 /home/hyw/chendawei/classification-weight/,
+     不要混进代码目录。
+
+----------------------------------------------------------------
+
+## 8. 评价口径与约定
+- 唯一判据: test slide04 的端到端 5µm F1;patch 级指标不作数。
+- 先按惯例: 在 test 上扫阈值取最优(oracle)报告(后续再谈固定阈值 / 多 seed)。
+- 长任务: 给命令 + 人工 tail -f 监控,不轮询。
+
+----------------------------------------------------------------
+
+## 9. 风险与备选
+- 域偏移(MIDOG++ -> ICPR2012): 零样本效果未知,必须先实测。
+  - 若差 -> 用法2: 加载其权重,在我们 train(00-02)上微调(头/LoRA/全量)。
+  - 或用法3: 冻结 backbone,只用 3584-d 特征 + 新头,在我们数据上训。
+- 输入必须原始背景(白板会 OOD)。
+- mask 中心用 mask bbox 中心(贴合其口径)。
+- 只在我们 train 上训练/微调,test(04)仅评估(无泄漏;该权重训练集为 MIDOG++,不含 ICPR2012)。
+
+----------------------------------------------------------------
+
+## 10. 参考: 需要保留的关键代码要点
+- DANNModel.forward 返回 (mitosis_logits, domain_logits);推理用 predict_only。
+- predict_only 内部: stem->layer2->layer3->layer4 -> 各自 AdaptiveAvgPool2d(1) -> cat -> mitosis_classifier。
+- 归一化/裁剪见 第2节、第3节。
